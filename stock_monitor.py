@@ -1,194 +1,120 @@
-import os, re, time, threading, traceback, datetime as dt
+import os, re, time, threading, traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from playwright.sync_api import sync_playwright
 import requests
 
 # ========= CONFIG =========
-PRODUCT_URL      = os.getenv("PRODUCT_URL", "https://ubersaccount.selly.store/product/82c13699")
-DISCORD_WEBHOOK  = os.getenv("DISCORD_WEBHOOK", "https://discordapp.com/api/webhooks/1403822999450423456/5umMV4migfB5Z4WqGVxzD-AJsEWno4AC-U_YmnEHJNGwLrPP9bpLvrtQAh4mTGC20K7")
-CHECK_INTERVAL   = float(os.getenv("CHECK_INTERVAL", "3"))     # seconds
-ALERT_COOLDOWN   = float(os.getenv("ALERT_COOLDOWN", "60"))    # seconds
-STOCK_SELECTOR   = os.getenv("STOCK_SELECTOR", ".tox9o4ajE28leI_5ZvBv")
-COOKIE_HEADER    = os.getenv("COOKIE_HEADER", "").strip()      # usually not needed w/ Playwright
-HEARTBEAT_SEC    = int(os.getenv("HEARTBEAT_SEC", "300"))      # 5 min heartbeat
-RECYCLE_EVERY_S  = int(os.getenv("RECYCLE_EVERY_SEC", "21600"))# recycle browser every 6h (21600)
+PRODUCT_URL = os.getenv("PRODUCT_URL", "https://ubersaccount.selly.store/product/82c13699")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discordapp.com/api/webhooks/1403822999450423456/5umMV4migfB5Z4WqGVxzD-AJsEWno4AC-U_YmnEHJNGwLrPP9bpLvrtQAh4mTGC20K7")
+CHECK_INTERVAL = float(os.getenv("CHECK_INTERVAL", "3"))
+ALERT_COOLDOWN = float(os.getenv("ALERT_COOLDOWN", "60"))
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))
 
 STRICT_STOCK = re.compile(r"\b(\d+)\s*(?:in\s*stock)\b", re.I)
 
-# ========= HEALTH SERVER (keeps service "alive") =========
+# ========= HEALTH SERVER =========
 def start_http_server():
     port = int(os.getenv("PORT", "8080"))
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200); self.send_header("Content-Type", "text/plain")
-            self.end_headers(); self.wfile.write(b"ok")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Railway bot is running!")
         def log_message(self, *a): return
-    threading.Thread(target=HTTPServer(("0.0.0.0", port), H).serve_forever, daemon=True).start()
+    
+    server = HTTPServer(("0.0.0.0", port), H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[*] HTTP health server listening on :{port}")
 
 # ========= DISCORD =========
 def send_discord(msg: str):
     if not DISCORD_WEBHOOK:
-        print("[!] DISCORD_WEBHOOK missing — skipping"); return
+        print("[!] DISCORD_WEBHOOK missing")
+        return
     try:
         r = requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
-        print(f"[*] Discord -> {r.status_code} | {msg[:140]}")
+        print(f"[*] Discord -> {r.status_code} | {msg[:100]}")
     except Exception as e:
         print(f"[!] Discord failed: {e}")
 
-# ========= BADGE READERS =========
-def read_badge_qty(page):
-    el = page.query_selector(STOCK_SELECTOR)
-    if not el:
-        print("[i] Badge not found"); return None
-    txt = (el.inner_text() or "").strip()
-    m = STRICT_STOCK.search(txt)
-    if m:
-        qty = int(m.group(1))
-    elif "out of stock" in txt.lower():
-        qty = 0
-    else:
-        qty = None
-    print(f"[*] BADGE -> {txt!r} => {qty}")
-    return qty
+# ========= STOCK CHECKER =========
+def check_stock():
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        url = f"{PRODUCT_URL}?t={int(time.time())}"
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        html = response.text.lower()
+        
+        if "out of stock" in html or "sold out" in html:
+            return 0
+        elif re.search(STRICT_STOCK, response.text):
+            match = re.search(STRICT_STOCK, response.text)
+            return int(match.group(1))
+        elif "add to cart" in html:
+            return 1
+        return None
+        
+    except Exception as e:
+        print(f"[!] Stock check failed: {e}")
+        return None
 
-def check_once(page, product_url):
-    url = f"{product_url}?t={int(time.time())}"
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(700)  # let React render
-
-    # First read
-    qty1 = read_badge_qty(page)
-
-    # Confirm after 500ms
-    page.wait_for_timeout(500)
-    qty2 = read_badge_qty(page)
-
-    return qty2 if qty2 is not None else qty1
-
-# ========= BOT RUNNER (single browser lifecycle) =========
-def run_bot_once():
-    print("[*] Selly restock monitor (STRICT badge-only, debounced)")
-    print(f"    URL: {PRODUCT_URL} | Interval: {CHECK_INTERVAL}s | Cooldown: {ALERT_COOLDOWN}s")
-    if not DISCORD_WEBHOOK:
-        print("[!] Set DISCORD_WEBHOOK to your webhook URL (in Railway → Variables).")
-    send_discord(f"✅ Bot online. Watching: {PRODUCT_URL} (every {int(CHECK_INTERVAL)}s)")
-
-    last_state = None           # "in" | "out"
-    last_alert_ts = 0.0
-    confirm_counter = 0         # require 2 consecutive in-stock reads
-    last_heartbeat = 0.0
-    started_at = time.time()
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-        ))
-
-        # Optional cookies (rare with Playwright)
-        if COOKIE_HEADER:
-            cookies = []
-            for part in COOKIE_HEADER.split(";"):
-                if "=" in part:
-                    k, v = part.strip().split("=", 1)
-                    cookies.append({"name": k.strip(), "value": v.strip(), "url": "https://ubersaccount.selly.store"})
-            if cookies:
-                context.add_cookies(cookies)
-
-        page = context.new_page()
-
-        try:
-            while True:
-                cycle_start = time.time()
-
-                try:
-                    # Check stock
-                    qty = check_once(page, PRODUCT_URL)
-                    now = time.time()
-
-                    # Determine state
-                    current_state = "in" if (qty is not None and qty > 0) else "out"
-
-                    # State transition logic
-                    if current_state == "in" and last_state != "in":
-                        confirm_counter += 1
-                        print(f"[*] Stock detected! Confirmation #{confirm_counter}/2")
-                        
-                        if confirm_counter >= 2:
-                            # Send alert if cooldown passed
-                            if now - last_alert_ts >= ALERT_COOLDOWN:
-                                msg = f"🚨 **RESTOCK ALERT!** {qty} in stock at {PRODUCT_URL}"
-                                send_discord(msg)
-                                last_alert_ts = now
-                                print(f"[!] ALERT SENT: {qty} in stock")
-                            else:
-                                remaining = int(ALERT_COOLDOWN - (now - last_alert_ts))
-                                print(f"[i] Stock found but cooldown active ({remaining}s remaining)")
-                            
-                            last_state = "in"
-                            confirm_counter = 0
-                    elif current_state == "out":
-                        if last_state == "in":
-                            print("[*] Stock went out")
-                        last_state = "out"
-                        confirm_counter = 0
-                    # If still "in" and was "in", no change needed
-
-                    # Heartbeat
-                    if now - last_heartbeat >= HEARTBEAT_SEC:
-                        uptime_mins = int((now - started_at) / 60)
-                        msg = f"💓 Bot alive ({uptime_mins}m uptime). Last check: {current_state} stock"
-                        send_discord(msg)
-                        last_heartbeat = now
-
-                except Exception as e:
-                    print(f"[!] Check failed: {e}")
-                    traceback.print_exc()
-
-                # Wait for next check
-                elapsed = time.time() - cycle_start
-                sleep_time = max(0, CHECK_INTERVAL - elapsed)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-        finally:
-            browser.close()
-
-# ========= MAIN LOOP (with browser recycling) =========
+# ========= MAIN =========
 def main():
     start_http_server()
+    print("[*] Stock monitor starting...")
     
-    while True:
-        try:
-            print(f"\n[*] Starting new browser session (will recycle in {RECYCLE_EVERY_S}s)")
+    send_discord("✅ Bot online on Railway!")
+    
+    last_state = None
+    last_alert_ts = 0.0
+    confirm_counter = 0
+    last_heartbeat = 0.0
+    started_at = time.time()
+    
+    try:
+        while True:
+            cycle_start = time.time()
             
-            # Run bot with timeout for browser recycling
-            start_time = time.time()
-            
-            def run_with_timeout():
-                run_bot_once()
-            
-            bot_thread = threading.Thread(target=run_with_timeout)
-            bot_thread.daemon = True
-            bot_thread.start()
-            
-            # Wait for recycle time or thread completion
-            bot_thread.join(timeout=RECYCLE_EVERY_S)
-            
-            if bot_thread.is_alive():
-                print("[*] Browser recycle time reached, restarting...")
-            else:
-                print("[*] Bot thread completed, restarting...")
+            try:
+                qty = check_stock()
+                now = time.time()
+                current_state = "in" if (qty and qty > 0) else "out"
                 
-        except KeyboardInterrupt:
-            print("\n[*] Stopping...")
-            break
-        except Exception as e:
-            print(f"[!] Main loop error: {e}")
-            traceback.print_exc()
-            time.sleep(30)  # Wait before restart
+                if current_state == "in" and last_state != "in":
+                    confirm_counter += 1
+                    print(f"[*] Stock detected! Confirmation #{confirm_counter}/2")
+                    
+                    if confirm_counter >= 2:
+                        if now - last_alert_ts >= ALERT_COOLDOWN:
+                            send_discord(f"🚨 **RESTOCK!** {qty} in stock at {PRODUCT_URL}")
+                            last_alert_ts = now
+                            print(f"[!] ALERT SENT: {qty} in stock")
+                        
+                        last_state = "in"
+                        confirm_counter = 0
+                elif current_state == "out":
+                    last_state = "out"
+                    confirm_counter = 0
+                
+                if now - last_heartbeat >= HEARTBEAT_SEC:
+                    uptime_mins = int((now - started_at) / 60)
+                    send_discord(f"💓 Bot alive ({uptime_mins}m). Status: {current_state}")
+                    last_heartbeat = now
+                    
+            except Exception as e:
+                print(f"[!] Check failed: {e}")
+            
+            elapsed = time.time() - cycle_start
+            sleep_time = max(0, CHECK_INTERVAL - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                
+    except KeyboardInterrupt:
+        send_discord("🛑 Bot stopped")
 
 if __name__ == "__main__":
-    main() 
+    main()
